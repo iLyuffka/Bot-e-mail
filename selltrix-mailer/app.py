@@ -1,11 +1,12 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openpyxl==3.1.5", "email-validator==2.3.0", "keyring>=25.0"]
+# dependencies = ["openpyxl==3.1.5", "email-validator==2.3.0"]
 # ///
 # Run: uv run app.py (Windows: START.bat).
 import sqlite3
 import tkinter as tk
 from functools import partial
+from itertools import islice
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
@@ -13,17 +14,8 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from zipfile import BadZipFile
 
-from contacts import InputError, address, recipients
-from engine import (
-    SENDER,
-    Campaign,
-    Journal,
-    deliver,
-    preview_batch,
-    run_batch,
-    smtp_send,
-)
-from secrets_store import WindowsCredentialStore, load_password, save_password
+from contacts import InputError, RecipientBatch, address, recipients
+from engine import SENDER, Campaign, Journal, deliver, run_batch, smtp_send
 
 
 class App:
@@ -31,7 +23,7 @@ class App:
         self.root = root
         self.base = Path(__file__).resolve().parent
         self.journal = Journal(self.base / "journal.sqlite3")
-        self.emails: tuple[str, ...] = ()
+        self.emails: RecipientBatch | None = None
         self.stop = Event()
         self.events: Queue[str] = Queue()
         self.worker: Thread | None = None
@@ -50,7 +42,7 @@ class App:
         self.interval = tk.StringVar(value="180")
         self.consent = tk.BooleanVar(value=False)
         self.optouts = tk.BooleanVar(value=False)
-        ttk.Label(frame, text="Пароль приложения (можно сохранить в Credential Manager Windows)").pack(anchor="w", pady=(10, 0))
+        ttk.Label(frame, text="Пароль приложения (только в памяти, не сохраняется)").pack(anchor="w", pady=(10, 0))
         ttk.Entry(frame, textvariable=self.password, show="*").pack(fill="x")
         ttk.Label(frame, text="Тема").pack(anchor="w", pady=(8, 0))
         ttk.Entry(frame, textvariable=self.subject).pack(fill="x")
@@ -70,7 +62,7 @@ class App:
         ttk.Checkbutton(frame, variable=self.optouts, text="Перед этой партией проверены ответы, отписки и недоставки; стоп-лист обновлён").pack(anchor="w")
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=8)
-        for label, command in (("Сохранить пароль для автозапуска", self.save_password), ("Загрузить Excel", self.load), ("Предпросмотр без отправки", self.preview), ("Тест себе", self.test), ("Запустить партию", self.start_batch), ("СТОП", self.stop.set), ("Стоп-лист +", self.suppress), ("Журнал", self.report)):
+        for label, command in (("Загрузить Excel", self.load), ("Тест себе", self.test), ("Запустить партию", self.start_batch), ("СТОП", self.stop.set), ("Стоп-лист +", self.suppress), ("Журнал", self.report)):
             ttk.Button(buttons, text=label, command=command).pack(side="left", padx=2)
         self.log = ScrolledText(frame, height=6, wrap="word", state="disabled")
         self.log.pack(fill="x")
@@ -87,25 +79,25 @@ class App:
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
-        self.emails = ()
+        self.emails = None
         self.consent.set(False)
         self.optouts.set(False)
         self.count.set("Загрузка...")
         try:
-            emails, skipped = recipients(Path(path))
-            self.emails = tuple(emails)
-            self.count.set(f"Разрешено в Excel: {len(emails)}; исключено: {skipped}. Журнал и стоп-лист проверяются при отправке.")
+            batch = recipients(Path(path))
+            self.emails = batch
+            self.count.set(f"Разрешено в Excel: {batch.allowed}; исключено: {batch.skipped}. Журнал и стоп-лист проверяются при отправке.")
         except (InputError, OSError, BadZipFile, ValueError, KeyError) as exc:
             self.count.set("Импорт не выполнен. Очередь пуста.")
             messagebox.showerror("Excel", str(exc))
 
     def config(self) -> Campaign:
+        if not self.password.get().strip():
+            raise InputError("Введите пароль приложения.")
         return Campaign(self.subject.get(), self.body.get("1.0", "end-1c"), int(self.limit.get()), int(self.start.get()), int(self.end.get()), int(self.interval.get()))
 
-    def launch(self, campaign: Campaign, emails: tuple[str, ...], *, test: bool) -> None:
+    def launch(self, campaign: Campaign, emails: tuple[str, ...] | RecipientBatch, *, test: bool) -> None:
         password = self.password.get()
-        if not password.strip():
-            password = load_password(WindowsCredentialStore())
         self.password.set("")
         self.stop.clear()
         self.optouts.set(False)
@@ -123,35 +115,6 @@ class App:
                 self.events.put("Работа завершена. Новая партия требует подтверждения и ввода пароля.")
         self.worker = Thread(target=work, daemon=False)
         self.worker.start()
-
-    def save_password(self) -> None:
-        try:
-            save_password(WindowsCredentialStore(), self.password.get())
-            self.password.set("")
-            messagebox.showinfo("Автозапуск", "Пароль сохранён в Credential Manager Windows для текущего пользователя.")
-        except InputError as exc:
-            messagebox.showerror("Автозапуск", str(exc))
-
-    def preview(self) -> None:
-        if self.busy():
-            return
-        try:
-            campaign = self.config()
-            if not self.emails:
-                raise InputError("Сначала загрузите Excel с утверждёнными получателями.")
-            report = preview_batch(self.journal, campaign, self.emails)
-            addresses = "\n".join(report.ready[:10]) or "нет"
-            messagebox.showinfo(
-                "Предпросмотр без отправки",
-                f"Готово к новой попытке: {len(report.ready)}\n"
-                f"В стоп-листе: {len(report.suppressed)}\n"
-                f"Уже в журнале: {len(report.already_recorded)}\n"
-                f"Остаток дневного лимита: {report.remaining_today}\n\n"
-                f"Первые адреса:\n{addresses}\n\n"
-                "Письма не отправлялись и журнал не изменён.",
-            )
-        except (InputError, ValueError, sqlite3.Error) as exc:
-            messagebox.showerror("Предпросмотр", str(exc))
 
     def test(self) -> None:
         if self.busy():
@@ -172,9 +135,9 @@ class App:
             return
         try:
             campaign = self.config()
-            if not self.emails or not self.consent.get() or not self.optouts.get():
+            if self.emails is None or self.emails.allowed == 0 or not self.consent.get() or not self.optouts.get():
                 raise InputError("Загрузите утверждённый список и подтвердите согласия и проверку отписок.")
-            preview = "\n".join(self.emails[:10])
+            preview = "\n".join(islice(self.emails, 10))
             if messagebox.askyesno("Подтвердить реальную отправку", f"От: {SENDER}\nТема: {campaign.subject}\nВ списке: {len(self.emails)}\nЛимит: {campaign.daily_limit} попыток/день\nЧасы Windows: {campaign.start_hour}–{campaign.end_hour}\nПервые адреса:\n{preview}\n\nОтправлять текст, показанный в окне?"):
                 self.launch(campaign, self.emails, test=False)
         except (InputError, ValueError) as exc:

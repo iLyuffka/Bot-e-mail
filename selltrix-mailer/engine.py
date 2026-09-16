@@ -3,7 +3,7 @@ import smtplib
 import sqlite3
 import ssl
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
@@ -39,14 +39,6 @@ class Campaign:
             raise InputError("Часы: 0 ≤ начало < конец ≤ 24.")
         if not 60 <= self.interval <= 3600:
             raise InputError("Интервал: от 60 до 3600 секунд.")
-
-
-@dataclass(frozen=True, slots=True)
-class BatchPreview:
-    ready: tuple[str, ...]
-    suppressed: tuple[str, ...]
-    already_recorded: tuple[str, ...]
-    remaining_today: int
 
 
 class Journal:
@@ -90,25 +82,6 @@ class Journal:
         with closing(sqlite3.connect(self.path)) as db:
             return str(db.execute("SELECT message_id FROM attempts WHERE key=?", (key,)).fetchone()[0])
 
-    def preview(self, emails: tuple[str, ...], limit: int) -> BatchPreview:
-        """Classify a proposed batch without inserting into the journal."""
-        today = datetime.now().astimezone().date().isoformat()
-        with closing(sqlite3.connect(self.path)) as db:
-            suppressed = {str(row[0]) for row in db.execute("SELECT email FROM suppressed")}
-            recorded = {
-                str(row[0])
-                for row in db.execute("SELECT email FROM attempts WHERE key=email")
-            }
-            count = int(
-                db.execute("SELECT COUNT(*) FROM attempts WHERE day=?", (today,)).fetchone()[0]
-            )
-        return BatchPreview(
-            ready=tuple(email for email in emails if email not in suppressed and email not in recorded),
-            suppressed=tuple(email for email in emails if email in suppressed),
-            already_recorded=tuple(email for email in emails if email in recorded),
-            remaining_today=max(limit - count, 0),
-        )
-
     def report(self) -> str:
         with closing(sqlite3.connect(self.path)) as db:
             rows = db.execute("SELECT time,email,status FROM attempts ORDER BY time DESC LIMIT 500").fetchall()
@@ -124,13 +97,6 @@ def smtp_send(message: EmailMessage, password: str) -> None:
         server.send_message(message)
     finally:
         server.close()
-
-
-def preview_batch(
-    journal: Journal, campaign: Campaign, emails: tuple[str, ...]
-) -> BatchPreview:
-    """Render a local sendability report without network or journal writes."""
-    return journal.preview(emails, campaign.daily_limit)
 
 
 def deliver(journal: Journal, campaign: Campaign, email: str, *,
@@ -154,7 +120,7 @@ def deliver(journal: Journal, campaign: Campaign, email: str, *,
     return True
 
 
-def run_batch(campaign: Campaign, emails: tuple[str, ...], *, journal: Journal,
+def run_batch(campaign: Campaign, emails: Iterable[str], *, journal: Journal,
               stop: Event, send: Callable[[EmailMessage], None], notify: Callable[[str], None]) -> None:
     """A daily batch expires at midnight; next day's opt-outs require review."""
     day = datetime.now().astimezone().date()

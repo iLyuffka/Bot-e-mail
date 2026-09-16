@@ -1,4 +1,5 @@
 """Read only explicitly approved, unflagged Excel recipients."""
+from collections.abc import Generator, Iterator
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,16 @@ class InputError(Exception):
         return self.detail
 
 
+@dataclass(frozen=True, slots=True)
+class RecipientBatch:
+    path: Path
+    allowed: int
+    skipped: int
+
+    def __iter__(self) -> Iterator[str]:
+        return _iter_recipients(self.path)
+
+
 def address(value: str) -> str:
     try:
         return validate_email(
@@ -24,7 +35,7 @@ def address(value: str) -> str:
         raise InputError(f"Некорректный email: {value}") from exc
 
 
-def recipients(path: Path) -> tuple[list[str], int]:
+def _iter_recipients(path: Path) -> Generator[str, None, int]:
     """Require an explicit approval column; do not infer consent from names."""
     with closing(load_workbook(path, read_only=True, data_only=False)) as book:
         sheet_name = "К отправке"
@@ -46,7 +57,6 @@ def recipients(path: Path) -> tuple[list[str], int]:
             for row in book[name].iter_rows(min_row=2, values_only=True):
                 if len(row) >= 7 and (name != "Полный аудит изменений" or "R3" in str(row[6])):
                     blocked.add(str(row[4] or "").strip().lower())
-        result: list[str] = []
         seen: set[str] = set()
         skipped = 0
         for row in rows:
@@ -62,5 +72,16 @@ def recipients(path: Path) -> tuple[list[str], int]:
                 skipped += 1
                 continue
             seen.add(email)
-            result.append(email)
-        return result, skipped
+            yield email
+        return skipped
+
+
+def recipients(path: Path) -> RecipientBatch:
+    source = _iter_recipients(path)
+    allowed = 0
+    while True:
+        try:
+            next(source)
+            allowed += 1
+        except StopIteration as result:
+            return RecipientBatch(path, allowed, int(result.value))
