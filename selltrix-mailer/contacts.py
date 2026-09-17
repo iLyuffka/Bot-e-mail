@@ -25,6 +25,9 @@ class RecipientBatch:
     def __iter__(self) -> Iterator[str]:
         return _iter_recipients(self.path)
 
+    def __len__(self) -> int:
+        return self.allowed
+
 
 def address(value: str) -> str:
     try:

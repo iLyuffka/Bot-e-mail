@@ -28,6 +28,7 @@ def test_recipients_streams_approved_addresses_after_counting_them(tmp_path: Pat
     assert isinstance(batch, RecipientBatch)
     assert batch.allowed == 2
     assert batch.skipped == 2
+    assert len(batch) == 2
     assert not hasattr(batch, "emails")
     assert tuple(batch) == ("first@example.com", "second@example.com")
     assert tuple(batch) == ("first@example.com", "second@example.com")
